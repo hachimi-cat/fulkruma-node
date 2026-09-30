@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { GeneratedApi } from './api.generated.js';
 import {
   ApiEnvelope,
   Product,
@@ -71,8 +72,6 @@ export interface ProductCreateInput {
   height?: number;
   licenseEnabled?: boolean;
   maxActivations?: number;
-  externalRef?: string;
-  externalSource?: string;
 }
 
 export interface VariantCreateInput {
@@ -83,8 +82,6 @@ export interface VariantCreateInput {
   lowStockThreshold?: number;
   weight?: number;
   isDefault?: boolean;
-  externalRef?: string;
-  externalSource?: string;
 }
 
 export interface WarehouseCreateInput {
@@ -138,8 +135,13 @@ export class FulkrumaClient {
     return { signature, timestamp: ts };
   }
 
+  /**
+   * One signed API call. The signature covers exactly the bytes sent: the JSON body,
+   * or '' when there is none — an empty object or array is sent as no body at all.
+   */
   async request<T>(args: FetchArgs): Promise<T> {
-    const bodyJson = args.body !== undefined ? JSON.stringify(args.body) : null;
+    let bodyJson = args.body !== undefined && args.body !== null ? JSON.stringify(args.body) : null;
+    if (bodyJson === '{}' || bodyJson === '[]') bodyJson = null;
     const { signature, timestamp } = this.sign({
       method: args.method,
       path: args.path,
@@ -188,6 +190,24 @@ export class FulkrumaClient {
 
   private genIdem(): string {
     return `idem_${crypto.randomUUID()}`;
+  }
+
+  /** Every feature route, one method each (generated from the API spec: api.generated.ts). */
+  readonly api: GeneratedApi = new GeneratedApi(this);
+
+  /** The call behind `client.api.*`: signed like every other request. */
+  async apigenRequest(method: string, path: string, query: Record<string, unknown> | undefined, body: unknown): Promise<unknown> {
+    const qs = query
+      ? new URLSearchParams(
+          Object.entries(query).map(([k, v]): [string, string] => [k, typeof v === 'string' ? v : JSON.stringify(v)]),
+        ).toString()
+      : '';
+    return this.request<unknown>({
+      method: method as FetchArgs['method'],
+      path: qs ? `${path}?${qs}` : path,
+      body,
+      idempotencyKey: method === 'GET' ? undefined : this.genIdem(),
+    });
   }
 
   // ─── Resources ──────────────────────────────────────────────
@@ -273,7 +293,7 @@ export class FulkrumaClient {
       destination: Record<string, unknown>;
       items: Array<Record<string, unknown>>;
       externalSource?: string; externalRef?: string;
-    }) => this.request<{ shipment: Shipment }>({
+    }) => this.request<{ shipment: Shipment; draftCreateError?: string | null }>({
       method: 'POST', path: '/api/v1/shipments', body: input, idempotencyKey: this.genIdem(),
     }),
     // F-004 / S-045 — confirm a Biteship draft → real order (driver
@@ -367,7 +387,7 @@ export class FulkrumaClient {
         method: 'POST', path: '/api/v1/licenses', body: input, idempotencyKey: this.genIdem(),
       }),
     revoke: (id: string) =>
-      this.request<{ license: License }>({ method: 'POST', path: `/api/v1/licenses/${id}/revoke`, body: {} }),
+      this.request<{ license: License }>({ method: 'POST', path: `/api/v1/licenses/${id}/revoke` }),
     /** Public unauthenticated — buyers' apps call this with just the key. */
     activate: (input: { key: string; instanceId: string }) =>
       this.request<{ license: License; activation: LicenseActivation; alreadyActive: boolean }>({
@@ -401,21 +421,27 @@ export class FulkrumaClient {
 
   // ─── API keys ────────────────────────────────────────────────
   apiKeys = {
-    list: () => this.request<{ keys: Array<Record<string, unknown>> }>({
+    list: () => this.request<{ apiKeys: Array<Record<string, unknown>> }>({
       method: 'GET', path: '/api/v1/api-keys',
     }),
-    create: (input: { description?: string; scope?: string } = {}) => this.request<{ key: Record<string, unknown> }>({
+    /** `scopes` defaults to ['read', 'write'] on the server. The response is the only
+     *  time `secret` is ever returned. */
+    create: (input: { name: string; scopes?: Array<'read' | 'write' | 'admin'> }) => this.request<{
+      apiKey: { id: string; name: string; keyId: string; scopes: string[]; createdAt: string };
+      secret: string;
+    }>({
       method: 'POST', path: '/api/v1/api-keys', body: input, idempotencyKey: this.genIdem(),
     }),
-    revoke: (id: string) => this.request<{ revoked: boolean }>({
-      method: 'POST', path: `/api/v1/api-keys/${id}/revoke`, body: {},
+    revoke: (id: string) => this.request<{ apiKey: { id: string; revokedAt: string } }>({
+      method: 'POST', path: `/api/v1/api-keys/${id}/revoke`,
     }),
   };
 
   // ─── Audit log ───────────────────────────────────────────────
   auditLog = {
-    list: (params: { limit?: number; cursor?: string; since?: string; eventType?: string } = {}) =>
-      this.request<{ entries: Array<Record<string, unknown>>; nextCursor?: string }>({
+    /** Newest first. `action` matches a prefix (e.g. 'api_key.'); `limit` is at most 500 (default 100). */
+    list: (params: { action?: string; target_type?: string; limit?: number } = {}) =>
+      this.request<{ entries: Array<Record<string, unknown>> }>({
         method: 'GET', path: `/api/v1/audit-log${qs(params)}`,
       }),
   };
@@ -426,16 +452,19 @@ export class FulkrumaClient {
     currentPlan: () => this.request<Record<string, unknown>>({ method: 'GET', path: '/api/v1/billing/plan' }),
     subscription: () => this.request<Record<string, unknown>>({ method: 'GET', path: '/api/v1/billing/subscription' }),
     usage: () => this.request<Record<string, unknown>>({ method: 'GET', path: '/api/v1/billing/usage' }),
+    /** Newest first; `limit` is at most 50 (default 20). Pass the returned `cursor` to get the next page. */
     invoices: (params: { limit?: number; cursor?: string } = {}) =>
-      this.request<{ invoices: Array<Record<string, unknown>>; nextCursor?: string }>({
+      this.request<{ data: Array<Record<string, unknown>>; cursor: string | null; hasMore: boolean }>({
         method: 'GET', path: `/api/v1/billing/invoices${qs(params)}`,
       }),
-    checkout: (input: { planId: string; successUrl?: string; cancelUrl?: string }) =>
-      this.request<{ url: string; sessionId: string }>({
+    /** `email` is required when the caller is an API key (it has no email of its own).
+     *  `currency` defaults by the caller's country: IDR in Indonesia, USD elsewhere. */
+    checkout: (input: { plan: 'STARTER' | 'GROWTH' | 'SCALE'; email?: string; name?: string; currency?: 'IDR' | 'USD' }) =>
+      this.request<{ subscriptionId: string; invoiceId: string; checkoutSessionId: string; checkoutUrl: string }>({
         method: 'POST', path: '/api/v1/billing/checkout', body: input,
       }),
     cancel: () => this.request<Record<string, unknown>>({
-      method: 'POST', path: '/api/v1/billing/cancel', body: {},
+      method: 'POST', path: '/api/v1/billing/cancel',
     }),
   };
 
@@ -463,8 +492,9 @@ export class FulkrumaClient {
       this.request<{ endpoints: Array<Record<string, unknown>> }>({
         method: 'GET', path: '/api/v1/webhooks/endpoints',
       }),
+    /** The response is the only time the endpoint's signing `secret` is returned. */
     createEndpoint: (input: { url: string; events?: string[]; description?: string }) =>
-      this.request<{ endpoint: Record<string, unknown> }>({
+      this.request<{ endpoint: Record<string, unknown>; secret: string }>({
         method: 'POST', path: '/api/v1/webhooks/endpoints', body: input, idempotencyKey: this.genIdem(),
       }),
     updateEndpoint: (id: string, patch: Partial<{ url: string; events: string[]; description: string; active: boolean }>) =>
@@ -473,9 +503,10 @@ export class FulkrumaClient {
       }),
     deleteEndpoint: (id: string) =>
       this.request<{ deleted: boolean }>({ method: 'DELETE', path: `/api/v1/webhooks/endpoints/${id}` }),
-    listEvents: (params: { limit?: number; cursor?: string; type?: string } = {}) =>
-      this.request<{ events: Array<Record<string, unknown>>; nextCursor?: string }>({
-        method: 'GET', path: `/api/v1/webhooks/events${qs(params)}`,
+    /** The 50 most recent events. */
+    listEvents: () =>
+      this.request<{ events: Array<Record<string, unknown>> }>({
+        method: 'GET', path: '/api/v1/webhooks/events',
       }),
   };
 
